@@ -48,15 +48,17 @@ void step5(int *assignment, double *distMatrix, bool *starMatrix, bool *newStarM
  * */
 enum state_codes {init, idle, tracking, saving, sending, endd};
 enum return_codes {ok, repeat, err};
-int init_state(void);
-int idle_state(void);
-int tracking_state(void);
-int saving_state(void);
-int sending_state(void);
-int end_state(void);
-int lookup_next_state(enum state_codes sc, enum return_codes rc);
+enum return_codes init_state(void);
+enum return_codes idle_state(void);
+enum return_codes tracking_state(cv::Mat * image_array);
+enum return_codes saving_state(cv::Mat * image_array);
+enum return_codes sending_state(void);
+enum return_codes end_state(void);
+enum state_codes lookup_next_state(enum state_codes sc, enum return_codes rc);
 
-int (*function_ptr[])(void) = {init_state, idle_state, tracking_state, saving_state, sending_state, end_state};
+//typedef enum return_codes (*function_ptr)(void);
+//const int NUM_FUNC_STATES = 6;
+//function_ptr func_table[NUM_FUNC_STATES] = {(function_ptr)init_state, (function_ptr)idle_state, (function_ptr)tracking_state, (function_ptr)saving_state, (function_ptr)sending_state, (function_ptr)end_state};
 
 struct transition
 {
@@ -114,6 +116,83 @@ cv::Mat img_bgr;
 cudaError_t cuda_rtn;
 int i2c_rtn;
 
+// resolution = width X height.
+// width = columns.
+// height = rows.
+int capture_width = 1280 ;
+int capture_height = 720 ;
+int display_width = 1280 ;
+int display_height = 720 ;
+int framerate = 30 ;
+int flip_method = 2 ;
+bool img_grabbed = false;
+
+
+// PID loop initializations.
+clock_t ticks_start, ticks_end;     // clock ticks
+float iteration_time = 0;           // iteration time.
+
+float error_prior_x = 0;
+float integral_prior_x = 0;
+float derivative_prior_x = 0;
+
+float error_prior_y = 0;
+float integral_prior_y = 0;
+float derivative_prior_y = 0;
+
+float kp = 0.03;     // PID loop tuning parameters.
+float ki = 0.025;
+float kd = 0.00;
+int bias = 0;
+
+uint32_t cam_center_y = capture_height / 2;
+uint32_t cam_center_x = capture_width / 2;
+
+
+// NRF24 SPI decleration..
+char rising[7] = GPIO_EDGE_RISE;
+const char dev[32] = "/dev/spidev0.0";
+uint8_t mode = 0x00;	// SPI_MODE_0.
+uint8_t bits = 8;
+uint32_t speed = 1000000;
+int lsb_setting = 0;
+int nrf_spi_fd;
+
+// pan and tilt decleration
+__uint8_t pan = 90;
+__uint8_t tilt = 90;
+__uint8_t pan_set = pan;
+__uint8_t tilt_set = tilt;
+
+bool detection_found = false;   // If a detection is found. 
+bool record_done = false;       // Indicates if recording is finished.
+float record_seconds = 5.0;     // amount of seconds to record.
+float cooldown_time = 0.0;      // Time to cooldown after recording.
+int frame_idx = 0;              // Current frame index, used for saving images.
+
+const uint32_t overlay_flags = detectNet::OverlayFlagsFromStr("box,labels,conf");
+
+float time_no_detect = 0.0;
+bool lock_no_detect = false;
+
+vector <double> prev_x1;
+vector <double> prev_x2;
+vector <double> prev_y1;
+vector <double> prev_y2;
+vector <double> prev_area;
+
+double x1_p;
+double x2_p;
+double y1_p;
+double y2_p;
+double area;
+
+vector<vector<double>> iou_scores;
+
+detectNet::Detection* detections;
+int number_frames = record_seconds * framerate;        // Number of frames in recording time.
+int num_detections;
+
 
 
 void sig_handler(int signo)
@@ -144,7 +223,6 @@ string gstreamer_pipeline (int capture_width, int capture_height, int display_wi
  * */
 int free_resources(int i2c_fd, uchar3 * img_buffer, detectNet * net) 
 {
-    
     i2c_close(i2c_fd);
     CUDA_FREE(img_buffer);
     SAFE_DELETE(net);
@@ -156,215 +234,13 @@ int free_resources(int i2c_fd, uchar3 * img_buffer, detectNet * net)
 
 void * object_tracker(void * threadID) 
 {
-    // resolution = width X height.
-    // width = columns.
-    // height = rows.
-    int capture_width = 1280 ;
-    int capture_height = 720 ;
-    int display_width = 1280 ;
-    int display_height = 720 ;
-    int framerate = 30 ;
-    int flip_method = 2 ;
-    bool img_grabbed = false;
-
-    /*
-        PID loop initializations.
-    */
-    clock_t ticks_start, ticks_end;     // clock ticks
-    float iteration_time = 0;           // iteration time.
-    
-    float error_prior_x = 0;
-    float integral_prior_x = 0;
-    float derivative_prior_x = 0;
-
-    float error_prior_y = 0;
-    float integral_prior_y = 0;
-    float derivative_prior_y = 0;
-
-    float kp = 0.03;     // PID loop tuning parameters.
-    float ki = 0.025;
-    float kd = 0.00;
-    int bias = 0;
-
-    if(signal(SIGINT, sig_handler) == SIG_ERR)
-    {
-        LogError("cant catch SIGINT\n");
-    }
-
-    uint32_t cam_center_y = capture_height / 2;
-    uint32_t cam_center_x = capture_width / 2;
-
-    // total size a function of width, bytes, and height.
-    cuda_rtn = cudaMalloc((void**) &img_buffer, (size_t) capture_width * sizeof(uchar3) * capture_height);
-    if(cuda_rtn != 0)
-    {
-        printf("cudaMalloc() error: %i\n", cuda_rtn);
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    /*
-     *	NRF24 SPI initialization.
-     * */
-    char rising[7] = GPIO_EDGE_RISE;
-    const char dev[32] = "/dev/spidev0.0";
-    uint8_t mode = 0x00;	// SPI_MODE_0.
-    uint8_t bits = 8;
-    uint32_t speed = 1000000;
-    int lsb_setting = 0;
-    int nrf_spi_fd;
-
-    gpio_export(GPIO_CE);
-    gpio_set_dir(GPIO_CE, GPIO_DIR_OUTPUT);	// Set GPIO_CE as output.
-
-    gpio_export(GPIO_IRQ);
-    gpio_set_dir(GPIO_IRQ, GPIO_DIR_INPUT);	// Set GPIO_IRQ as input.
-    gpio_set_edge(GPIO_IRQ, rising);
-    gpio_set_active_edge(GPIO_IRQ);	// Set to active low.
-
-    nrf_spi_fd = spi_init(dev, mode, bits, speed, lsb_setting);
-
-    if(nrf_spi_fd < 0)
-    {
-	printf("Failed to initialize SPI: %i \n", nrf_spi_fd);
-	free_resources(i2c_fd, img_buffer, net);
-    	pthread_exit((void *) 1);
-    }
-
-    char addr;
-    char msg[5];
-
-    /**
-     *	NOTE: For auto-ack transmit and receive 
-     *	address must be equivalent.
-     * */
-    msg[0] = 'R'; msg[1] = 'x'; msg[2] = 'A';
-    msg[3] = 'A'; msg[4] = 'A';
-
-    nrf_set_rx_address(nrf_spi_fd, msg, 0);
-
-    nrf_set_tx_address(nrf_spi_fd, msg);
-
-    nrf_tx_init(nrf_spi_fd);
-
-    /* 
-        I2C & slave initialization.
-    */
-    __uint8_t pan = 90;
-    __uint8_t tilt = 90;
-    __uint8_t pan_set = pan;
-    __uint8_t tilt_set = tilt;
-
-    i2c_fd = i2c_init(adapter_nr_global, addr_global);
-
-    if(i2c_fd < 0)
-    {
-        printf("i2c_init() failed.\n");
-        return 0;
-    	pthread_exit((void *) 1);
-    }
-
-    i2c_rtn = PCA9685_init(i2c_fd);
-
-    if(i2c_rtn < 0)
-    {
-        printf("PCA9685_init() failed.\n");
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    if(PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan) < 0)
-    {
-        printf("PCA9685_set_servo_degree() failed.\n");
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    if(PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt) < 0)
-    {
-        printf("PCA9685_set_servo_degree() failed.\n");
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    /*
-        Video and object detection network initialization.
-    */
-/*
-    output = videoOutput::Create("display://0");
-
-    if(!output)
-    {
-        LogError("detectnet: failed to create output stream\n");
-        free_resources(i2c_fd,img_buffer,net,output);
-    	pthread_exit((void *) 1);
-    }
-*/
-
-    net = detectNet::Create(NULL,"/home/cap/Projects/object_detection/jetson-inference/python/training/detection/ssd/models/person/ssd-mobilenet.onnx",
-                            0.0f,
-                            "/home/cap/Projects/object_detection/jetson-inference/python/training/detection/ssd/models/person/labels.txt",
-                            0.5f, "input_0","scores", "boxes",DEFAULT_MAX_BATCH_SIZE,
-                            TYPE_FASTEST,DEVICE_GPU, true);
-
-    if(!net)
-    {
-        LogError("detectnet: Failed to load detectNet model\n");
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    /*
-        Video input stream initiazation.
-    */ 
-
-    string pipeline = gstreamer_pipeline(capture_width,
-        capture_height,
-        display_width,
-        display_height,
-        framerate,
-        flip_method);
-    cout << "Using pipeline: \n\t" << pipeline << "\n";
-
-    cap = new cv::VideoCapture(pipeline, cv::CAP_GSTREAMER);
-    if(!cap->isOpened()) {
-        std::cout<<"Failed to open camera."<<std::endl;
-        
-        cap->release();
-        free_resources(i2c_fd,img_buffer,net);
-    	pthread_exit((void *) 1);
-    }
-
-    bool detection_found = false;   // If a detection is found. 
-    bool record_done = false;       // Indicates if recording is finished.
-    float record_seconds = 5.0;     // amount of seconds to record.
-    float cooldown_time = 0.0;      // Time to cooldown after recording.
-    int number_frames = record_seconds * framerate;        // Number of frames in recording time.
     cv::Mat image_array[number_frames];     // Array of images containing the video.
-    int frame_idx = 0;              // Current frame index, used for saving images.
+    enum state_codes curr_state = init;
+    enum return_codes ret_code = ok;
 
-    const uint32_t overlay_flags = detectNet::OverlayFlagsFromStr("box,labels,conf");
-
-    float time_no_detect = 0.0;
-    bool lock_no_detect = false;
-
-    int curr_state = IDLE;
-
-    vector <double> prev_x1;
-    vector <double> prev_x2;
-    vector <double> prev_y1;
-    vector <double> prev_y2;
-    vector <double> prev_area;
-     
-    double x1;
-    double x2;
-    double y1;
-    double y2;
-    double area;
-
-    vector<vector<double>> iou_scores;
-
-    while(!signal_received)
+    ret_code = init_state();
+    //enum return_codes (*func)(void) = NULL;
+    while(1)
     {
         // Get start clock ticks.
         ticks_start = clock();
@@ -384,345 +260,42 @@ void * object_tracker(void * threadID)
                 break;
             }
 
-            detectNet::Detection* detections = NULL;
-            
+            	    
             // image parameter is uchar3.
-            const int numDetections = net->Detect(img_buffer, (uint32_t) capture_width,(uint32_t) capture_height, &detections, overlay_flags);
+            num_detections = net->Detect(img_buffer, (uint32_t) capture_width,(uint32_t) capture_height, &detections, overlay_flags);
 
-            switch(curr_state)
-            {
-                case IDLE :
-
-                    // Logic to reset the servos after a detection is no longer found. 
-                    if(lock_no_detect == true)
-                    {
-                        time_no_detect = time_no_detect + iteration_time;
-
-                        if(time_no_detect > (float) NUM_SEC_NO_DETECT)
-                        {
-                            lock_no_detect = false;
-                            //time_no_detect = 0.0;
-                            
-                            i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan_set);
-
-                            if(i2c_rtn < 0)
-                            {
-                                printf("PCA9685_set_servo_degree() DOWN_CHANNEL failed.\n");
-
-                                break;
-                            }
-
-                            i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt_set);
-
-                            if(i2c_rtn < 0)
-                            {
-                                printf("PCA9685_set_servo_degree() UP_CHANNEL failed.\n");
-
-                                break;
-                            }
-
-                            pan = pan_set;      // Reset the pan and tilt variables.
-                            tilt = tilt_set;
-                        }
-
-                    }
-
-                    if(numDetections > 0)
-                    {
-                        curr_state = TRACKING;
-                        lock_no_detect = true;
-                        time_no_detect = 0.0;
-                    }
-
-                    if(curr_state != TRACKING)
-                    {
-                        break;
-                    }
-
-                case TRACKING :
-		{
-
-		//cout << "NUM_DETECTIONS: " << numDetections << endl;
-
-		    // Implement tracking here
-
-		    // Calculate IOU scores.
-	            for(int i = 0; i < numDetections; ++i)
-		    {
-			detection_found = true; // TODO: Remove this 
-
-
-			// Assign bounding box coordinates.
-			x1 = (double) detections[i].Left;
-			y1 = (double) detections[i].Bottom;
-			x2 = (double) detections[i].Right;
-			y2 = (double) detections[i].Top;
-			area = (double) detections[i].Area();
-
-
-			// Check if there are previous bounding boxes.
-			if(prev_area.size() > 0)
-			{
-				//cout << "SIZE: " << prev_area.size() << endl;
-				iou_scores.push_back(vector<double>(prev_area.size(), 0));
-
-				for(int j = 0; j < prev_area.size(); ++j)
-				{
-					// Determine coordinates of intersection rectangle.
-					double x_left = max(x1, prev_x1[j]);
-					double y_top = max(y2, prev_y2[j]);
-					double y_bottom = min(y1, prev_y1[j]);
-					double x_right = min(x2, prev_x2[j]);
-
-					if((x_right < x_left) || (y_bottom < y_top))
-					{
-						iou_scores[i][j] = 0.0;
-						continue;
-					}
-					// The intersection is always axis-aligned.
-					double intersectionArea = (x_right - x_left) * (y_bottom - y_top);
-					// Compute the Intersection Over Union.
-					double iou = intersectionArea / (double) (prev_area[j] + area - intersectionArea);
-
-					iou_scores[i][j] = iou;
-				}
-			}
-		     }	    
-
-		    if(iou_scores.size() > 0)
-		    {
-			    vector<int> assignment;
-
-			    hungarian_solve(iou_scores, assignment);
-
-			    /*
-			    cout <<"ASSIGNMENT VECTOR: " << endl;
-			    for(int i = 0; i < assignment.size(); ++i)
-			    {
-				    cout << assignment[i] << endl;
-			    }
-			    */
-		    }
-
-    
-	    prev_x1.clear();	
-	    prev_y1.clear();	
-            prev_x2.clear();	
-	    prev_y2.clear();	
-            prev_area.clear();	
-	    // Save the bbox and area before the next 
-	    // iteration.
-	    for(int i = 0; i < numDetections; ++i)
+	    if(signal_received)
 	    {
-		// Assign bounding box coordinates.
-		prev_x1.push_back(detections[i].Left);
-		prev_y1.push_back(detections[i].Bottom);
-		prev_x2.push_back(detections[i].Right);
-		prev_y2.push_back(detections[i].Top);
-		prev_area.push_back(detections[i].Area());
-
-
-		/*
-		cout << "IOU_SCORE_MATRIX" << endl;
-		for(int i = 0; i < iou_scores.size(); ++i)
-		{
-			for(int j = 0; j < iou_scores[i].size(); ++j)
-			{
-				cout << iou_scores[i][j] << " ";
-			}	
-			cout << endl;
-		}
-		*/
-
-		iou_scores.clear();
+		    curr_state = endd;
 	    }
 
-
-
-                    for(int i = 0; i < numDetections; ++i)
-                    {
-                        if(detections[i].ClassID == 5)
-                        {
-                            if(detection_found == false)
-                            {
-                                detection_found = true;
-                            }
-
-                            float x_loc, y_loc;
-                            detections[i].Center(&x_loc, &y_loc);
-
-                            // Get the error from the center point.
-                            float x_error = x_loc - cam_center_x;
-                            float y_error = y_loc - cam_center_y;
-
-                            if(abs(x_error) > 50)
-                            {
-                                // Get the integral value.
-                                float integral_x = ((ki*iteration_time)/2) * (x_error+error_prior_x) + integral_prior_x;
-                                
-                                // Get the derivative value.
-                                float derivative_x = -(2.0 * kd *(x_error - error_prior_x)
-                                                    + (2.0 * 0.5 - iteration_time) * derivative_prior_x)
-                                                    / (2.0 * 0.5 + iteration_time);
-
-                                // Get the output pan/tilt step values.
-                                int pan_step = kp*x_error + integral_x + derivative_x + bias;
-
-                                if(pan_step < -180)
-                                {
-                                    pan_step = -180;
-                                }
-                                else if(pan_step > 180)
-                                {
-                                    pan_step = 180;
-                                }
-
-                                pan = pan + pan_step;
-                                i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan);
-
-                                if(i2c_rtn < 0)
-                                {
-                                    printf("PCA9685_set_servo_degree() DOWN_CHANNEL failed.\n");
-
-                                    break;
-                                }
-
-                                // Feedback variables.
-                                error_prior_x = x_error;
-                                integral_prior_x = integral_x;
-
-                                printf("pan vals \n");
-                                printf("iteration_time: %f \n", iteration_time);
-                                printf("x_error: %f \n", x_error);
-                                printf("integral_x: %f \n", integral_x);
-                                printf("derivative_x: %f \n", derivative_x);
-                                printf("pan_step: %i \n", pan_step);
-                                printf("pan: %i \n", pan);
-                            }
-
-                            if(abs(y_error) > 50)
-                            {
-                                // Get the integral value.
-                                float integral_y = ((ki*iteration_time)/2) * (y_error+error_prior_y) + integral_prior_y;
-                                
-                                // Get the derivative value.
-                                float derivative_y = -(2.0 * kd *(y_error - error_prior_y)
-                                                    + (2.0 * 0.5 - iteration_time) * derivative_prior_y)
-                                                    / (2.0 * 0.5 + iteration_time);
-
-                                // Get the output pan/tilt step values.
-                                int tilt_step = kp*x_error + integral_y + derivative_y + bias;
-
-                                if(tilt_step < -180)
-                                {
-                                    tilt_step = -180;
-                                }
-                                else if(tilt_step > 180)
-                                {
-                                    tilt_step = 180;
-                                }
-
-                                tilt = tilt + tilt_step;
-                                i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt);
-
-                                if(i2c_rtn < 0)
-                                {
-                                    printf("PCA9685_set_servo_degree() UP_CHANNEL failed.\n");
-
-                                    break;
-                                }
-
-                                // Feedback variables.
-                                error_prior_y = y_error;
-                                integral_prior_y = integral_y;
-
-                                printf("tilt vals \n");
-                                printf("iteration_time: %f \n", iteration_time);
-                                printf("y_error: %f \n", y_error);
-                                printf("integral_y: %f \n", integral_y);
-                                printf("derivative_y: %f \n", derivative_y);
-                                printf("tilt_step: %i \n", tilt_step);
-                                printf("tilt: %i \n", tilt);
-                            }
-
-			    break;
-                        }
-                    }
-
-
-
-
-
-                    if(detection_found == true)
-                    {
-                        //printf("Saved image! %i\n", frame_idx);
-                        image_array[frame_idx] = img_bgr;
-                        if(frame_idx == number_frames - 1)
-                        {
-                            curr_state = SAVING;
-                        }
-                        frame_idx += 1;
-                        img_bgr = cv::Mat();    // Reset the image variable so the pixels are refreshed.
-                    }
-
-                    if(curr_state != SAVING)
-                    {
-                        break;
-                    }
-
-		}
-                case SAVING :
-                {
-			
-                    printf("starting video write...\n");
-                    string gst_save = "appsrc ! video/x-raw, format=BGR ! queue ! videoconvert ! video/x-raw,format=RGBA ! nvvidconv ! nvv4l2h264enc ! h264parse ! qtmux ! filesink location=vid.h264";
-
-		    char filename[30];
-		    sprintf(filename, "img.jpg");
-
-                    cv::imwrite(filename,image_array[20]);
-                    
-                    cv::VideoWriter video(gst_save,cv::CAP_GSTREAMER,(float) number_frames/record_seconds,cv::Size(display_width, display_height), true);
-                    
-                    for(int i = 0; i < number_frames; ++i)
-                    {
-                        video.write(image_array[i]);
-                    }
-                    detection_found = false;
-                    frame_idx = 0;
-                    record_done = false;
-
-                    video.release();
-                    printf("############# RECORDING DONE ##############\n");
-
-                    curr_state = SENDING;
-
-                    break;
-                }
-		case SENDING:
-		{
-			// Set transceiver into transmit mode and send video and image.
-
-			cout << "sending image..." << endl;
-
-			FILE * fp = fopen("img.jpg", "r");
-			send_file(nrf_spi_fd, fp, 0);
-			fclose(fp);
-
-			cout << "sending video..." << endl;
-
-			fp = fopen("vid.h264", "r");
-			send_file(nrf_spi_fd, fp, 1);
-			fclose(fp);
-
-			cout << "completed sending." << endl;
-
-			curr_state = IDLE;
-			
+	    switch(curr_state)
+	    {
+		case idle:
+			ret_code = idle_state();
 			break;
-		}
+		case tracking:
+			ret_code = tracking_state(image_array);
+			break;
+		case saving:
+			ret_code = saving_state(image_array);
+			break;
+		case sending:
+			ret_code = sending_state();
+			break;
+		case endd:
+			ret_code = end_state();
+			break;
+		default:
+			break;
+	    }
 
-            }
+	    if(curr_state == endd)
+	    {
+		    break;
+	    }
+
+	    curr_state = lookup_next_state(curr_state, ret_code);
 
 
 /*	    
@@ -747,19 +320,6 @@ void * object_tracker(void * threadID)
 
         //net->PrintProfilerTimes();
     }
-
-    // Deallocating all resources.
-    LogVerbose("detectnet: shutting down...\n");
-    LogVerbose("camera stream: shutting down...\n");
-    LogVerbose("I2C interface: shutting down...\n");
-
-    //SAFE_DELETE(output);
-    cap->release();
-    cap->release();
-    free_resources(i2c_fd,img_buffer,net);
-    close(nrf_spi_fd);
-
-    LogVerbose("Object tracking shutdown complete.\n");
 
     pthread_exit(0);
 
@@ -1140,31 +700,462 @@ void step5(int *assignment, double *distMatrix, bool *starMatrix, bool *newStarM
 	step3(assignment, distMatrix, starMatrix, newStarMatrix, primeMatrix, coveredColumns, coveredRows, nOfRows, nOfColumns, minDim);
 }
 
-int init_state(void)
+enum return_codes init_state(void)
 {
+    if(signal(SIGINT, sig_handler) == SIG_ERR)
+    {
+        LogError("cant catch SIGINT\n");
+    }
+
+    // total size a function of width, bytes, and height.
+    cuda_rtn = cudaMalloc((void**) &img_buffer, (size_t) capture_width * sizeof(uchar3) * capture_height);
+    if(cuda_rtn != 0)
+    {
+        printf("cudaMalloc() error: %i\n", cuda_rtn);
+	return err;
+    }
+
+    gpio_export(GPIO_CE);
+    gpio_set_dir(GPIO_CE, GPIO_DIR_OUTPUT);	// Set GPIO_CE as output.
+
+    gpio_export(GPIO_IRQ);
+    gpio_set_dir(GPIO_IRQ, GPIO_DIR_INPUT);	// Set GPIO_IRQ as input.
+    gpio_set_edge(GPIO_IRQ, rising);
+    gpio_set_active_edge(GPIO_IRQ);	// Set to active low.
+
+    nrf_spi_fd = spi_init(dev, mode, bits, speed, lsb_setting);
+
+    if(nrf_spi_fd < 0)
+    {
+	printf("Failed to initialize SPI: %i \n", nrf_spi_fd);
+	return err;
+    }
+
+    char addr;
+    char msg[5];
+
+    /**
+     *	NOTE: For auto-ack transmit and receive 
+     *	address must be equivalent.
+     * */
+    msg[0] = 'R'; msg[1] = 'x'; msg[2] = 'A';
+    msg[3] = 'A'; msg[4] = 'A';
+
+    nrf_set_rx_address(nrf_spi_fd, msg, 0);
+
+    nrf_set_tx_address(nrf_spi_fd, msg);
+
+    nrf_tx_init(nrf_spi_fd);
+
+    /* 
+        I2C & slave initialization.
+    */
+    i2c_fd = i2c_init(adapter_nr_global, addr_global);
+
+    if(i2c_fd < 0)
+    {
+        printf("i2c_init() failed.\n");
+        return err;
+    }
+
+    i2c_rtn = PCA9685_init(i2c_fd);
+
+    if(i2c_rtn < 0)
+    {
+        printf("PCA9685_init() failed.\n");
+	return err;
+    }
+
+    if(PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan) < 0)
+    {
+        printf("PCA9685_set_servo_degree() failed.\n");
+	return err;
+    }
+
+    if(PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt) < 0)
+    {
+        printf("PCA9685_set_servo_degree() failed.\n");
+	return err;
+    }
+
+    /*
+        Video and object detection network initialization.
+    */
+/*
+    output = videoOutput::Create("display://0");
+
+    if(!output)
+    {
+        LogError("detectnet: failed to create output stream\n");
+        free_resources(i2c_fd,img_buffer,net,output);
+    	pthread_exit((void *) 1);
+    }
+*/
+
+    net = detectNet::Create(NULL,"/home/cap/Projects/object_detection/jetson-inference/python/training/detection/ssd/models/person/ssd-mobilenet.onnx",
+                            0.0f,
+                            "/home/cap/Projects/object_detection/jetson-inference/python/training/detection/ssd/models/person/labels.txt",
+                            0.5f, "input_0","scores", "boxes",DEFAULT_MAX_BATCH_SIZE,
+                            TYPE_FASTEST,DEVICE_GPU, true);
+
+    if(!net)
+    {
+        LogError("detectnet: Failed to load detectNet model\n");
+	return err;
+    }
+
+    /*
+        Video input stream initiazation.
+    */ 
+
+    string pipeline = gstreamer_pipeline(capture_width,
+        capture_height,
+        display_width,
+        display_height,
+        framerate,
+        flip_method);
+    cout << "Using pipeline: \n\t" << pipeline << "\n";
+
+    cap = new cv::VideoCapture(pipeline, cv::CAP_GSTREAMER);
+    if(!cap->isOpened()) {
+        std::cout<<"Failed to open camera."<<std::endl;
+    	return err;    
+    }
+
+
 	return ok;
 }
-int idle_state(void)
+enum return_codes idle_state(void)
 {
+
+    // Logic to reset the servos after a detection is no longer found. 
+    if(lock_no_detect == true)
+    {
+	time_no_detect = time_no_detect + iteration_time;
+
+	if(time_no_detect > (float) NUM_SEC_NO_DETECT)
+	{
+	    lock_no_detect = false;
+	    //time_no_detect = 0.0;
+	    
+	    i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan_set);
+
+	    if(i2c_rtn < 0)
+	    {
+		printf("PCA9685_set_servo_degree() DOWN_CHANNEL failed.\n");
+
+		return err;
+	    }
+
+	    i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt_set);
+
+	    if(i2c_rtn < 0)
+	    {
+		printf("PCA9685_set_servo_degree() UP_CHANNEL failed.\n");
+
+		return err;
+	    }
+
+	    pan = pan_set;      // Reset the pan and tilt variables.
+	    tilt = tilt_set;
+	}
+
+    }
+
+    if(num_detections > 0)
+    {
+	lock_no_detect = true;
+	time_no_detect = 0.0;
+	return ok; // transition to next state when detection found.
+    }
+
+	return repeat;
+}
+enum return_codes tracking_state(cv::Mat * image_array)
+{
+    //cout << "NUM_DETECTIONS: " << num_detections << endl;
+
+    // Implement tracking here
+
+    // Calculate IOU scores.
+    for(int i = 0; i < num_detections; ++i)
+    {
+	detection_found = true; // TODO: Remove this 
+
+
+	// Assign bounding box coordinates.
+	x1_p = (double) detections[i].Left;
+	y1_p = (double) detections[i].Bottom;
+	x2_p = (double) detections[i].Right;
+	y2_p = (double) detections[i].Top;
+	area = (double) detections[i].Area();
+
+
+	// Check if there are previous bounding boxes.
+	if(prev_area.size() > 0)
+	{
+		//cout << "SIZE: " << prev_area.size() << endl;
+		iou_scores.push_back(vector<double>(prev_area.size(), 0));
+
+		for(int j = 0; j < prev_area.size(); ++j)
+		{
+			// Determine coordinates of intersection rectangle.
+			double x_left = max(x1_p, prev_x1[j]);
+			double y_top = max(y2_p, prev_y2[j]);
+			double y_bottom = min(y1_p, prev_y1[j]);
+			double x_right = min(x2_p, prev_x2[j]);
+
+			if((x_right < x_left) || (y_bottom < y_top))
+			{
+				iou_scores[i][j] = 0.0;
+				continue;
+			}
+			// The intersection is always axis-aligned.
+			double intersectionArea = (x_right - x_left) * (y_bottom - y_top);
+			// Compute the Intersection Over Union.
+			double iou = intersectionArea / (double) (prev_area[j] + area - intersectionArea);
+
+			iou_scores[i][j] = iou;
+		}
+	}
+     }	    
+
+    if(iou_scores.size() > 0)
+    {
+	    vector<int> assignment;
+
+	    hungarian_solve(iou_scores, assignment);
+
+	    /*
+	    cout <<"ASSIGNMENT VECTOR: " << endl;
+	    for(int i = 0; i < assignment.size(); ++i)
+	    {
+		    cout << assignment[i] << endl;
+	    }
+	    */
+    }
+
+
+	prev_x1.clear();	
+	prev_y1.clear();	
+	prev_x2.clear();	
+	prev_y2.clear();	
+	prev_area.clear();	
+	// Save the bbox and area before the next 
+	// iteration.
+	for(int i = 0; i < num_detections; ++i)
+	{
+	// Assign bounding box coordinates.
+	prev_x1.push_back(detections[i].Left);
+	prev_y1.push_back(detections[i].Bottom);
+	prev_x2.push_back(detections[i].Right);
+	prev_y2.push_back(detections[i].Top);
+	prev_area.push_back(detections[i].Area());
+
+
+	/*
+	cout << "IOU_SCORE_MATRIX" << endl;
+	for(int i = 0; i < iou_scores.size(); ++i)
+	{
+		for(int j = 0; j < iou_scores[i].size(); ++j)
+		{
+			cout << iou_scores[i][j] << " ";
+		}	
+		cout << endl;
+	}
+	*/
+
+	iou_scores.clear();
+	}
+
+
+
+    for(int i = 0; i < num_detections; ++i)
+    {
+	if(detections[i].ClassID == 5)
+	{
+	    if(detection_found == false)
+	    {
+		detection_found = true;
+	    }
+
+	    float x_loc, y_loc;
+	    detections[i].Center(&x_loc, &y_loc);
+
+	    // Get the error from the center point.
+	    float x_error = x_loc - cam_center_x;
+	    float y_error = y_loc - cam_center_y;
+
+	    if(abs(x_error) > 50)
+	    {
+		// Get the integral value.
+		float integral_x = ((ki*iteration_time)/2) * (x_error+error_prior_x) + integral_prior_x;
+		
+		// Get the derivative value.
+		float derivative_x = -(2.0 * kd *(x_error - error_prior_x)
+				    + (2.0 * 0.5 - iteration_time) * derivative_prior_x)
+				    / (2.0 * 0.5 + iteration_time);
+
+		// Get the output pan/tilt step values.
+		int pan_step = kp*x_error + integral_x + derivative_x + bias;
+
+		if(pan_step < -180)
+		{
+		    pan_step = -180;
+		}
+		else if(pan_step > 180)
+		{
+		    pan_step = 180;
+		}
+
+		pan = pan + pan_step;
+		i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_DOWN_CH, pan);
+
+		if(i2c_rtn < 0)
+		{
+		    printf("PCA9685_set_servo_degree() DOWN_CHANNEL failed.\n");
+		    return ok;
+		}
+
+		// Feedback variables.
+		error_prior_x = x_error;
+		integral_prior_x = integral_x;
+
+		printf("pan vals \n");
+		printf("iteration_time: %f \n", iteration_time);
+		printf("x_error: %f \n", x_error);
+		printf("integral_x: %f \n", integral_x);
+		printf("derivative_x: %f \n", derivative_x);
+		printf("pan_step: %i \n", pan_step);
+		printf("pan: %i \n", pan);
+	    }
+
+	    if(abs(y_error) > 50)
+	    {
+		// Get the integral value.
+		float integral_y = ((ki*iteration_time)/2) * (y_error+error_prior_y) + integral_prior_y;
+		
+		// Get the derivative value.
+		float derivative_y = -(2.0 * kd *(y_error - error_prior_y)
+				    + (2.0 * 0.5 - iteration_time) * derivative_prior_y)
+				    / (2.0 * 0.5 + iteration_time);
+
+		// Get the output pan/tilt step values.
+		int tilt_step = kp*x_error + integral_y + derivative_y + bias;
+
+		if(tilt_step < -180)
+		{
+		    tilt_step = -180;
+		}
+		else if(tilt_step > 180)
+		{
+		    tilt_step = 180;
+		}
+
+		tilt = tilt + tilt_step;
+		i2c_rtn = PCA9685_set_servo_degree(i2c_fd, SERVO_UP_CH, tilt);
+
+		if(i2c_rtn < 0)
+		{
+		    printf("PCA9685_set_servo_degree() UP_CHANNEL failed.\n");
+
+		    return ok;	// TODO: what to do here?
+		}
+
+		// Feedback variables.
+		error_prior_y = y_error;
+		integral_prior_y = integral_y;
+
+		printf("tilt vals \n");
+		printf("iteration_time: %f \n", iteration_time);
+		printf("y_error: %f \n", y_error);
+		printf("integral_y: %f \n", integral_y);
+		printf("derivative_y: %f \n", derivative_y);
+		printf("tilt_step: %i \n", tilt_step);
+		printf("tilt: %i \n", tilt);
+	    }
+	}
+    }
+
+    if(detection_found == true)
+    {
+	//printf("Saved image! %i\n", frame_idx);
+	image_array[frame_idx] = img_bgr;
+	if(frame_idx == number_frames - 1)
+	{
+	    frame_idx = 0;
+	    return ok;	// transition to next state once all frames saved.
+	}
+	frame_idx += 1;
+	img_bgr = cv::Mat();    // Reset the image variable so the pixels are refreshed.
+    }
+
+	return repeat;
+}
+enum return_codes saving_state(cv::Mat * image_array)
+{
+    printf("starting video write...\n");
+    string gst_save = "appsrc ! video/x-raw, format=BGR ! queue ! videoconvert ! video/x-raw,format=RGBA ! nvvidconv ! nvv4l2h264enc ! h264parse ! qtmux ! filesink location=vid.h264";
+
+    char filename[30];
+    sprintf(filename, "img.jpg");
+
+    cv::imwrite(filename,image_array[20]);
+    
+    cv::VideoWriter video(gst_save,cv::CAP_GSTREAMER,(float) number_frames/record_seconds,cv::Size(display_width, display_height), true);
+    
+    for(int i = 0; i < number_frames; ++i)
+    {
+	video.write(image_array[i]);
+    }
+    video.release();
+
+    detection_found = false;
+    record_done = false;
+
+    printf("############# RECORDING DONE ##############\n");
+
+    return ok;
+}
+enum return_codes sending_state(void)
+{
+	// Set transceiver into transmit mode and send video and image.
+
+	cout << "sending image..." << endl;
+
+	/*
+	FILE * fp = fopen("img.jpg", "r");
+	send_file(nrf_spi_fd, fp, 0);
+	fclose(fp);
+
+	cout << "sending video..." << endl;
+
+	fp = fopen("vid.h264", "r");
+	send_file(nrf_spi_fd, fp, 1);
+	fclose(fp);
+
+	cout << "completed sending." << endl;
+
+	*/
 	return ok;
 }
-int tracking_state(void)
+enum return_codes end_state(void)
 {
+    // Deallocating all resources.
+    LogVerbose("detectnet: shutting down...\n");
+    LogVerbose("camera stream: shutting down...\n");
+    LogVerbose("I2C interface: shutting down...\n");
+
+    //SAFE_DELETE(output);
+    cap->release();
+    free_resources(i2c_fd,img_buffer,net);
+    close(nrf_spi_fd);
+
+    LogVerbose("Object tracking shutdown complete.\n");
+
 	return ok;
 }
-int saving_state(void)
+enum state_codes lookup_next_state(enum state_codes sc, enum return_codes rc)
 {
-	return ok;
-}
-int sending_state(void)
-{
-	return ok;
-}
-int end_state(void)
-{
-	return ok;
-}
-int lookup_next_state(enum state_codes sc, enum return_codes rc)
-{
-	lookup_table[sc][rc].next_state;
+	return lookup_table[sc][rc].next_state;
 }
